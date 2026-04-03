@@ -1,4 +1,4 @@
-# 🛡️ Aegis-AST
+# 🛡️ Aegis
 
 ### Secure Package Installation via Static Code Verification
 
