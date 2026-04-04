@@ -17,9 +17,11 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
+import { execSync } from 'child_process';
+import * as readline from 'readline';
 
 // Core modules
-import { fetchPackage, extractImports, compareDependencies } from './core';
+import { fetchPackage, extractImports, compareDependencies, cleanup } from './core';
 import { calculateRisk, applyPolicy } from './core';
 
 // Scanners
@@ -30,10 +32,10 @@ import {
   scanFsAccess,
   scanExec,
   scanEval,
-} from './scanner';
+} from './scanner/index';
 
 // Utils
-import { logScanReport, initDatabase, closeDatabase } from './utils';
+import { logScanReport, getScanHistory, initDatabase, closeDatabase } from './utils';
 
 // Types
 import { RiskInput, SecurityScanResult, ScanReport } from './types';
@@ -41,12 +43,183 @@ import { RiskInput, SecurityScanResult, ScanReport } from './types';
 const program = new Command();
 
 program
-  .name('aegis')
+  .name('ags')
   .description(
     chalk.bold.cyan('🛡️  Aegis-AST') +
     ' — Secure Package Installation via Static Code Verification'
   )
   .version('1.0.0');
+
+// ─── Helpers ─────────────────────────────────────────────
+
+/**
+ * Prompts the user with a yes/no question and returns the answer.
+ */
+function askUser(question: string): Promise<boolean> {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes');
+    });
+  });
+}
+
+/**
+ * Runs the full scan pipeline and returns the scan report.
+ * Shared by both `install` and `scan` commands.
+ */
+async function runPipeline(packageName: string, version: string): Promise<{
+  report: ScanReport;
+  extractedPath: string;
+}> {
+  // ── 1. Show banner ──────────────────────────────────────
+  console.log(chalk.bold.cyan('\n🛡️  Aegis-A ST Security Scanner\n'));
+
+  // ── 2. Fetch package ────────────────────────────────────
+  const spinner = ora(`Fetching package ${packageName}@${version}...`).start();
+  let packageData;
+  try {
+    packageData = await fetchPackage(packageName, version);
+    spinner.succeed(`Fetched ${chalk.bold(packageName)} v${packageData.metadata.version}`);
+  } catch (error: any) {
+    spinner.fail(`Failed to fetch package: ${error.message}`);
+    process.exit(1);
+  }
+
+  // ── 3. Run all scanners in parallel ─────────────────────
+  const scanSpinner = ora('Running security scanners...').start();
+  const [imports, scripts, network, entropy, fs, exec, evalScan] = await Promise.all([
+    extractImports(packageData.extractedPath),
+    scanScripts(packageData.metadata.scripts || {}),
+    scanNetwork(packageData.extractedPath),
+    scanEntropy(packageData.extractedPath),
+    scanFsAccess(packageData.extractedPath),
+    scanExec(packageData.extractedPath),
+    scanEval(packageData.extractedPath),
+  ]);
+  scanSpinner.succeed('Security scans complete');
+
+  // ── 4. Compare dependencies ─────────────────────────────
+  const compareSpinner = ora('Comparing declared vs. used dependencies...').start();
+  const comparator = compareDependencies(packageData.metadata, imports);
+  compareSpinner.succeed('Dependency comparison complete');
+
+  // ── 5. Assemble security results & Build risk input ─────
+  const security: SecurityScanResult = {
+    scripts: scripts.scripts,
+    network: network.network,
+    entropy: entropy.entropy,
+    fs: fs.fs,
+    exec: exec.exec,
+    eval: evalScan.eval,
+  };
+
+  const riskInput: RiskInput = {
+    packageName,
+    packageVersion: packageData.metadata.version,
+    comparator,
+    security,
+  };
+
+  // ── 6. Calculate risk score ─────────────────────────────
+  const riskScore = calculateRisk(riskInput);
+
+  // ── 7. Apply policy ─────────────────────────────────────
+  const policy = applyPolicy(riskScore, riskInput);
+
+  // ── 8. Display results with rich formatting ─────────────
+  console.log(chalk.bold('\n═══════════════════════════════════════════'));
+  console.log(chalk.bold('  📊  SCAN RESULTS'));
+  console.log(chalk.bold('═══════════════════════════════════════════\n'));
+
+  // Package info
+  console.log(`  ${chalk.dim('Package:')}   ${chalk.bold(packageName)}`);
+  console.log(`  ${chalk.dim('Version:')}   ${packageData.metadata.version}`);
+  console.log();
+
+  // Risk score with color coding
+  const scoreColor = riskScore.total > 70 ? chalk.red : riskScore.total > 40 ? chalk.yellow : chalk.green;
+  console.log(`  ${chalk.dim('Risk Score:')} ${scoreColor.bold(String(riskScore.total) + ' / 100')}`);
+  console.log();
+
+  // Score breakdown
+  console.log(chalk.dim('  ── Score Breakdown ──────────────────────'));
+  const breakdownEntries = Object.entries(riskScore.breakdown) as [string, number][];
+  for (const [category, score] of breakdownEntries) {
+    if (score > 0) {
+      const icon = score >= 40 ? '🔴' : score >= 20 ? '🟡' : '🟢';
+      console.log(`    ${icon} ${chalk.dim(category.padEnd(12))} +${score}`);
+    }
+  }
+  console.log();
+
+  // Phantom dependencies (the core innovation)
+  if (comparator.phantom.length > 0) {
+    console.log(chalk.red.bold('  🚨 PHANTOM DEPENDENCIES DETECTED:'));
+    for (const dep of comparator.phantom) {
+      console.log(chalk.red(`     ⚠  ${dep} — declared but NEVER used`));
+    }
+    console.log();
+  }
+
+  // Security findings summary
+  if (security.scripts.length > 0) {
+    console.log(chalk.yellow(`  ⚠  ${security.scripts.length} suspicious script(s) found`));
+  }
+  if (security.network.length > 0) {
+    console.log(chalk.yellow(`  ⚠  ${security.network.length} network reference(s) found`));
+  }
+  if (security.entropy.length > 0) {
+    console.log(chalk.yellow(`  ⚠  ${security.entropy.length} high-entropy string(s) found`));
+  }
+  if (security.exec.length > 0) {
+    console.log(chalk.yellow(`  ⚠  ${security.exec.length} exec/spawn call(s) found`));
+  }
+  if (security.eval.length > 0) {
+    console.log(chalk.red(`  🚨 ${security.eval.length} eval/Function usage(s) found`));
+  }
+  if (security.fs.length > 0) {
+    console.log(chalk.yellow(`  ⚠  ${security.fs.length} filesystem access pattern(s) found`));
+  }
+  console.log();
+
+  // Decision
+  const decisionIcon = policy.decision === 'ALLOW' ? '✅' : policy.decision === 'FLAG' ? '⚠️' : '🛑';
+  const decisionColor = policy.decision === 'ALLOW' ? chalk.green : policy.decision === 'FLAG' ? chalk.yellow : chalk.red;
+  console.log(chalk.bold(`  ${decisionIcon}  Decision: ${decisionColor.bold(policy.decision)}`));
+  console.log();
+
+  // Reasons
+  if (policy.reasons.length > 0) {
+    console.log(chalk.dim('  ── Reasons ─────────────────────────────'));
+    for (const reason of policy.reasons) {
+      console.log(`    • ${reason}`);
+    }
+    console.log();
+  }
+
+  console.log(chalk.bold('═══════════════════════════════════════════\n'));
+
+  // Build the scan report
+  const report: ScanReport = {
+    package: packageName,
+    version: packageData.metadata.version,
+    timestamp: new Date().toISOString(),
+    score: riskScore.total,
+    decision: policy.decision,
+    reasons: policy.reasons,
+    details: {
+      comparator,
+      security,
+    },
+  };
+
+  return { report, extractedPath: packageData.extractedPath };
+}
 
 // ─── aegis install <package> ─────────────────────────────
 
@@ -56,22 +229,60 @@ program
   .option('-v, --pkg-version <version>', 'Package version', 'latest')
   .option('--skip-db', 'Skip MongoDB logging', false)
   .action(async (packageName: string, options) => {
-    // TODO: Person 4 implement
-    // Pipeline:
-    //   1. Show banner
-    //   2. Fetch package (with spinner)
-    //   3. Run all scanners in parallel
-    //   4. Compare dependencies
-    //   5. Calculate risk score
-    //   6. Apply policy
-    //   7. Display results with rich formatting
-    //   8. If ALLOW → proceed with npm install
-    //   9. If FLAG → ask user for confirmation
-    //  10. If BLOCK → refuse installation
-    //  11. Log to MongoDB
+    const { report, extractedPath } = await runPipeline(packageName, options.pkgVersion);
 
-    console.log(chalk.bold.cyan('\n🛡️  Aegis-AST Security Scanner\n'));
-    console.log(chalk.yellow('⚠️  Pipeline not yet integrated. Implement me!\n'));
+    let shouldInstall = false;
+
+    // ── 9. Decide whether to install ────────────────────────
+    if (report.decision === 'ALLOW') {
+      console.log(chalk.green('  Package passed all security checks.\n'));
+      shouldInstall = true;
+    } else if (report.decision === 'FLAG') {
+      console.log(chalk.yellow('  ⚠  Package has potential risks. Review the findings above.\n'));
+      shouldInstall = await askUser(
+        chalk.yellow('  Proceed with installation anyway? (y/N): ')
+      );
+      if (!shouldInstall) {
+        console.log(chalk.dim('\n  Installation cancelled by user.\n'));
+      }
+    } else {
+      // BLOCK
+      console.log(chalk.red.bold('  🛑  Installation BLOCKED — package is too risky.\n'));
+      shouldInstall = false;
+    }
+
+    // ── 10. Install if allowed ──────────────────────────────
+    if (shouldInstall) {
+      const installSpinner = ora(`Installing ${packageName}...`).start();
+      try {
+        const versionSuffix = options.pkgVersion !== 'latest' ? `@${options.pkgVersion}` : '';
+        execSync(`npm install ${packageName}${versionSuffix}`, {
+          stdio: 'pipe',
+        });
+        installSpinner.succeed(chalk.green(`Successfully installed ${packageName}`));
+      } catch (error: any) {
+        installSpinner.fail(`Installation failed: ${error.message}`);
+      }
+    }
+
+    // ── 11. Log to MongoDB ──────────────────────────────────
+    if (!options.skipDb) {
+      try {
+        await initDatabase();
+        await logScanReport(report);
+        await closeDatabase();
+        console.log(chalk.dim('  📝 Scan report logged to database.\n'));
+      } catch {
+        console.log(chalk.dim('  📝 Database logging skipped (connection unavailable).\n'));
+      }
+    }
+
+    // ── 12. Clean up temp files ──────────────────────────────
+    try {
+      await cleanup(extractedPath);
+    } catch {
+      // Silently ignore cleanup errors
+    }
   });
 
 // ─── aegis scan <package> ────────────────────────────────
@@ -80,12 +291,30 @@ program
   .command('scan <packageName>')
   .description('Scan a package without installing')
   .option('-v, --pkg-version <version>', 'Package version', 'latest')
+  .option('--skip-db', 'Skip MongoDB logging', false)
   .action(async (packageName: string, options) => {
-    // TODO: Person 4 implement
-    // Same as install but skip step 8-10
+    console.log(chalk.dim('  (scan-only mode — package will NOT be installed)\n'));
 
-    console.log(chalk.bold.cyan('\n🛡️  Aegis-AST Security Scanner (scan-only mode)\n'));
-    console.log(chalk.yellow('⚠️  Scan pipeline not yet integrated.\n'));
+    const { report, extractedPath } = await runPipeline(packageName, options.pkgVersion);
+
+    // Log to MongoDB
+    if (!options.skipDb) {
+      try {
+        await initDatabase();
+        await logScanReport(report);
+        await closeDatabase();
+        console.log(chalk.dim('  📝 Scan report logged to database.\n'));
+      } catch {
+        console.log(chalk.dim('  📝 Database logging skipped (connection unavailable).\n'));
+      }
+    }
+
+    // Clean up temp files
+    try {
+      await cleanup(extractedPath);
+    } catch {
+      // Silently ignore cleanup errors
+    }
   });
 
 // ─── aegis history <package> ─────────────────────────────
@@ -95,9 +324,49 @@ program
   .description('View scan history for a package')
   .option('-n, --limit <number>', 'Number of results', '10')
   .action(async (packageName: string, options) => {
-    // TODO: Person 4 implement
     console.log(chalk.bold.cyan('\n🛡️  Aegis-AST Scan History\n'));
-    console.log(chalk.yellow('⚠️  History viewer not yet implemented.\n'));
+
+    const limit = parseInt(options.limit, 10) || 10;
+
+    try {
+      await initDatabase();
+      const history = await getScanHistory(packageName, limit);
+      await closeDatabase();
+
+      if (history.length === 0) {
+        console.log(chalk.dim(`  No scan history found for ${packageName}.\n`));
+        return;
+      }
+
+      console.log(chalk.dim(`  Showing last ${history.length} scan(s) for ${chalk.bold(packageName)}:\n`));
+
+      for (const entry of history) {
+        const decisionColor =
+          entry.decision === 'ALLOW' ? chalk.green :
+            entry.decision === 'FLAG' ? chalk.yellow : chalk.red;
+        const scoreColor =
+          entry.score > 70 ? chalk.red :
+            entry.score > 40 ? chalk.yellow : chalk.green;
+
+        const timestamp = new Date(entry.timestamp).toLocaleString();
+
+        console.log(chalk.dim('  ──────────────────────────────────────'));
+        console.log(`  ${chalk.dim('Date:')}     ${timestamp}`);
+        console.log(`  ${chalk.dim('Version:')}  ${entry.version}`);
+        console.log(`  ${chalk.dim('Score:')}    ${scoreColor(String(entry.score) + '/100')}`);
+        console.log(`  ${chalk.dim('Decision:')} ${decisionColor.bold(entry.decision)}`);
+        if (entry.reasons.length > 0) {
+          console.log(`  ${chalk.dim('Reasons:')}`);
+          for (const reason of entry.reasons) {
+            console.log(`    • ${reason}`);
+          }
+        }
+        console.log();
+      }
+    } catch (error: any) {
+      console.log(chalk.red(`  ✖ Failed to retrieve history: ${error.message}\n`));
+      console.log(chalk.dim('  Make sure MongoDB is running and MONGODB_URI is configured.\n'));
+    }
   });
 
 // ─── Parse and execute ───────────────────────────────────
